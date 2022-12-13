@@ -11,16 +11,16 @@ readme = "README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-pulldown-cmark = "0.5.2"
+pulldown-cmark = "0.9"
 clap = "2.33.0"
 walkdir = "2.2.9"
 Inflector = "0.11.4"
 regex = "1.2.1"
-raqote = "0.6.1"
 log = "0.4.8"
-env_logger = "0.6.2"
+image = "0.24"
+fs-err = "2"
+env_logger = "0.10"
 html2md = "0.2.9"
-
-[dependencies.resvg]
-version = "0.7.0"
-features = ["raqote-backend"]
+resvg = { version = "0.28", features = [] }
+thiserror = "1"
+png = "0.17"

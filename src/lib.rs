@@ -5,18 +5,23 @@ use html2md::parse_html;
 extern crate log;
 extern crate env_logger;
 
+use fs_err as fs;
 use inflector::cases::kebabcase::to_kebab_case;
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 use regex::Regex;
-use resvg::prelude::*;
+use resvg::tiny_skia::Pixmap;
+use resvg::usvg;
+use resvg::{self, render};
 use std::default::Default;
 use std::ffi::OsStr;
-use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::path::Path;
 use std::string::String;
 use walkdir::WalkDir;
+
+pub mod error;
+pub use self::error::*;
 
 /// Used to keep track of current pulldown_cmark "event".
 /// TODO: Is there a native pulldown_cmark method to do this?
@@ -37,9 +42,8 @@ pub struct CurrentType {
 }
 
 /// Converts markdown string to tex string.
-pub fn markdown_to_tex(markdown: String) -> String {
+pub fn markdown_to_tex(markdown: String) -> Result<String> {
     let mut options = Options::empty();
-    options.insert(Options::FIRST_PASS);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_FOOTNOTES);
     options.insert(Options::ENABLE_TASKLISTS);
@@ -47,11 +51,11 @@ pub fn markdown_to_tex(markdown: String) -> String {
 
     let parser = Parser::new_ext(&markdown, options);
 
-    return parser_to_tex(parser);
+    parser_to_tex(parser)
 }
 
 /// Takes a pulldown_cmark::Parser or any iterator containing `pulldown_cmark::Event` and transforms it to a string
-pub fn parser_to_tex<'a, P>(parser: P) -> String
+pub fn parser_to_tex<'a, P>(parser: P) -> Result<String>
 where
     P: 'a + Iterator<Item = Event<'a>>,
 {
@@ -71,22 +75,21 @@ where
     for event in parser {
         debug!("Event: {:?}", event);
         match event {
-            Event::Start(Tag::Header(level)) => {
+            Event::Start(Tag::Heading(level, _maybe, _vec)) => {
                 current.event_type = EventType::Header;
                 output.push_str("\n");
                 output.push_str("\\");
                 match level {
-                    -1 => output.push_str("part{"),
-                    0 => output.push_str("chapter{"),
-                    1 => output.push_str("section{"),
-                    2 => output.push_str("subsection{"),
-                    3 => output.push_str("subsubsection{"),
-                    4 => output.push_str("paragraph{"),
-                    5 => output.push_str("subparagraph{"),
-                    _ => error!("header is out of range."),
+                    // -1 => output.push_str("part{"),
+                    HeadingLevel::H1 => output.push_str("chapter{"),
+                    HeadingLevel::H2 => output.push_str("section{"),
+                    HeadingLevel::H3 => output.push_str("subsection{"),
+                    HeadingLevel::H4 => output.push_str("subsubsection{"),
+                    HeadingLevel::H5 => output.push_str("paragraph{"),
+                    HeadingLevel::H6 => output.push_str("subparagraph{"),
                 }
             }
-            Event::End(Tag::Header(_)) => {
+            Event::End(Tag::Heading(_, _, _)) => {
                 output.push_str("}\n");
                 output.push_str("\\");
                 output.push_str("label{");
@@ -279,7 +282,7 @@ where
                     let _ = fs::create_dir_all(&filename_png);
                     let _ = fs::create_dir_all(Path::new(&filename_png).parent().unwrap());
 
-                    img.save(std::path::Path::new(&filename_png));
+                    fs::write(&filename_png, img)?;
                     path_str = filename_png.clone();
                 }
 
@@ -296,10 +299,10 @@ where
             Event::Start(Tag::Item) => output.push_str("\\item "),
             Event::End(Tag::Item) => output.push_str("\n"),
 
-            Event::Start(Tag::CodeBlock(lang)) => {
+            Event::Start(Tag::CodeBlock(kind)) => {
                 let re = Regex::new(r",.*").unwrap();
                 current.event_type = EventType::Code;
-                if !lang.is_empty() {
+                if let CodeBlockKind::Fenced(lang) = kind {
                     output.push_str("\\begin{lstlisting}[language=");
                     output.push_str(&re.replace(&lang, ""));
                     output.push_str("]\n");
@@ -316,30 +319,19 @@ where
             Event::Code(t) => {
                 output.push_str("\\lstinline|");
                 match current.event_type {
-                    EventType::Header => output.push_str(
-                        &*t.replace("#", r"\#")
-                            .replace("…", "...")
-                            .replace("З", "3"),
-                    ),
-                    _ => output.push_str(
-                        &*t.replace("…", "...")
-                            .replace("З", "3")
-                            .replace("�", r"\�"),
-                    ),
+                    EventType::Header => output
+                        .push_str(&*t.replace("#", r"\#").replace("…", "...").replace("З", "3")),
+                    _ => output
+                        .push_str(&*t.replace("…", "...").replace("З", "3").replace("�", r"\�")),
                 }
                 output.push_str("|");
-            }
-
-            Event::InlineHtml(t) => {
-                // convert common html patterns to tex
-                output.push_str(&html2tex(t.into_string(), &current));
-                current.event_type = EventType::Text;
             }
 
             Event::Html(t) => {
                 current.event_type = EventType::Html;
                 // convert common html patterns to tex
-                output.push_str(markdown_to_tex(parse_html(&t.into_string())).as_str());
+                let parsed = parse_html(&t.into_string());
+                output.push_str(markdown_to_tex(parsed)?.as_str());
                 current.event_type = EventType::Text;
             }
 
@@ -348,7 +340,6 @@ where
                 // and don't replace any characters.
                 let delim_start = vec![r"\(", r"\["];
                 let delim_end = vec![r"\)", r"\]"];
-
 
                 if buffer.len() > 100 {
                     buffer.clear();
@@ -419,14 +410,14 @@ where
         }
     }
 
-    output
+    Ok(output)
 }
 
 /// Simple HTML parser.
 ///
 /// Eventually I hope to use a mature HTML to tex parser.
 /// Something along the lines of https://github.com/Adonai/html2md/
-pub fn html2tex(html: String, current: &CurrentType) -> String {
+pub fn html2tex(html: String, current: &CurrentType) -> Result<String> {
     let mut tex = html;
     let mut output = String::new();
 
@@ -454,7 +445,7 @@ pub fn html2tex(html: String, current: &CurrentType) -> String {
             // create output directories.
             let _ = fs::create_dir_all(Path::new(&path).parent().unwrap());
 
-            img.save(std::path::Path::new(&path));
+            fs::write(&path, img)?;
         }
 
         match current.event_type {
@@ -500,7 +491,7 @@ pub fn html2tex(html: String, current: &CurrentType) -> String {
         output.push_str(&re.replace(&tex, ""));
     }
 
-    output
+    Ok(output)
 }
 
 /// Convert HTML description elements into LaTeX equivalents.
@@ -536,15 +527,20 @@ where
 /// Converts an SVG file to a PNG file.
 ///
 /// Example: foo.svg becomes foo.svg.png
-pub fn svg2png(filename: String) -> Option<Box<dyn OutputImage>> {
+pub fn svg2png(filename: String) -> Result<Vec<u8>> {
     debug!("svg2png path: {}", &filename);
-    let mut opt = resvg::Options::default();
-    opt.usvg.path = Some(filename.clone().into());
-
-    let rtree = usvg::Tree::from_file(&filename, &opt.usvg).unwrap();
-    let backend = resvg::default_backend();
-    let img = backend.render_to_image(&rtree, &opt);
-    img
+    let data = fs::read_to_string(filename)?;
+    let rtree = usvg::Tree::from_data(data.as_bytes(), &usvg::Options::default())?;
+    let mut pixi = Pixmap::new(rtree.size.width() as u32, rtree.size.height() as u32).unwrap();
+    render(
+        &rtree,
+        usvg::FitTo::Original,
+        resvg::tiny_skia::Transform::default(),
+        pixi.as_mut(),
+    )
+    .unwrap();
+    let img = pixi.encode_png().unwrap();
+    Ok(img)
 }
 
 /// Extract extension from filename
@@ -562,7 +558,7 @@ mod tests {
     fn markdown_to_tex_basic() {
         assert_eq!(
             "\nHello World~\\\\\n",
-            markdown_to_tex("Hello World".to_string())
+            markdown_to_tex("Hello World".to_string()).unwrap()
         );
     }
 
@@ -570,7 +566,7 @@ mod tests {
     fn markdown_to_tex_image() {
         assert_eq!(
             "\n\\begin{figure}\n\\centering\n\\includegraphics[width=\\textwidth]{../../src/image.png}\n\\caption{}\n\\end{figure}\n~\\\\\n",
-            markdown_to_tex("![](image.png)".to_string())
+            markdown_to_tex("![](image.png)".to_string()).unwrap()
         );
     }
 }
